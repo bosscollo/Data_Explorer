@@ -185,8 +185,9 @@ def load_geojson_from_drive():
         st.error(f"Traceback: {traceback.format_exc()}")
         return gpd.GeoDataFrame()
 
-def create_choropleth_map(gdf, indicator, centroid_y, centroid_x):
-    """Create an optimized Folium choropleth map."""
+@st.cache_data(ttl=300, show_spinner=False)
+def create_choropleth_map(_gdf, indicator, centroid_y, centroid_x):
+    """Create an optimized Folium choropleth map with caching."""
     try:
         m = folium.Map(
             location=[centroid_y, centroid_x],
@@ -197,7 +198,7 @@ def create_choropleth_map(gdf, indicator, centroid_y, centroid_x):
         )
         
         # Calculate min and max values, handling NaN
-        valid_values = gdf[indicator].dropna()
+        valid_values = _gdf[indicator].dropna()
         if len(valid_values) == 0:
             st.warning(f"No valid values found for {indicator}")
             return m
@@ -206,7 +207,7 @@ def create_choropleth_map(gdf, indicator, centroid_y, centroid_x):
         max_val = valid_values.max()
         
         # Prepare GeoJSON with proper structure
-        geojson_data = json.loads(gdf.to_json())
+        geojson_data = json.loads(_gdf.to_json())
         
         # Create style function that handles missing properties safely
         def style_function(feature):
@@ -242,7 +243,7 @@ def create_choropleth_map(gdf, indicator, centroid_y, centroid_x):
         tooltip_aliases = []
         
         for field, alias in [('ward', 'Ward:'), (indicator, f'{indicator}:'), ('county', 'County:')]:
-            if field in gdf.columns:
+            if field in _gdf.columns:
                 tooltip_fields.append(field)
                 tooltip_aliases.append(alias)
         
@@ -649,16 +650,25 @@ def main():
                 key='map_indicator'
             )
             
-            # Create and display map
-            with st.spinner("Creating map..."):
-                m = create_choropleth_map(gdf, selected_indicator, centroid_y, centroid_x)
+            # Create map using cached function
+            m = create_choropleth_map(gdf, selected_indicator, centroid_y, centroid_x)
             
-            # Display map with error handling
-            try:
-                st_folium(m, width=700, height=500, key=f"map_{selected_indicator}")
-            except Exception as e:
-                st.error(f"Map rendering error: {str(e)}")
-                st.info("Try refreshing the page or selecting a different indicator.")
+            # Display map with minimal interaction to prevent reruns
+            # Use a container to isolate the map
+            map_container = st.container()
+            with map_container:
+                try:
+                    # Critical fix: Don't capture return value, use returned_objects=[]
+                    st_folium(
+                        m, 
+                        width=700, 
+                        height=500,
+                        returned_objects=[],  # Prevent reruns from map interactions
+                        key="folium_map"  # Stable key
+                    )
+                except Exception as e:
+                    st.error(f"Map rendering error: {str(e)}")
+                    st.info("Try refreshing the page or selecting a different indicator.")
         
         with col2:
             st.subheader("Map Controls")
