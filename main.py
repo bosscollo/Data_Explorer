@@ -9,6 +9,7 @@ from branca.element import Template, MacroElement
 import json
 import matplotlib.cm as cm
 import matplotlib.colors as colors
+import io
 
 # Constants for optimization
 MAX_CHAT_HISTORY = 20
@@ -23,6 +24,8 @@ st.set_page_config(
 
 def get_color(value, min_val, max_val):
     """Get color for choropleth using matplotlib."""
+    if pd.isna(value):
+        return '#808080'  # Gray for missing values
     norm = colors.Normalize(vmin=min_val, vmax=max_val)
     cmap = cm.YlOrRd
     rgba = cmap(norm(value))
@@ -94,6 +97,22 @@ def init_gemini():
         st.error(f"Failed to initialize Gemini API: {str(e)}")
         return None, None
 
+def download_file_from_google_drive(file_id):
+    """Download file from Google Drive with proper handling of large files."""
+    URL = "https://docs.google.com/uc?export=download"
+    
+    session = requests.Session()
+    response = session.get(URL, params={'id': file_id}, stream=True, timeout=30)
+    
+    # Check for virus scan warning
+    for key, value in response.cookies.items():
+        if key.startswith('download_warning'):
+            params = {'id': file_id, 'confirm': value}
+            response = session.get(URL, params=params, stream=True, timeout=30)
+            break
+    
+    return response
+
 # Cache the data loading function to avoid reloading on every interaction
 @st.cache_data(ttl=3600, show_spinner="Loading ward data...")
 def load_geojson_from_drive():
@@ -105,41 +124,32 @@ def load_geojson_from_drive():
             st.error("Google Drive file ID not configured in secrets.")
             return gpd.GeoDataFrame()
         
-        # Create download URL
-        download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
-        
-        # Configure session for better performance
-        session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(
-            max_retries=3,
-            pool_connections=10,
-            pool_maxsize=10
-        )
-        session.mount('http://', adapter)
-        session.mount('https://', adapter)
-        
-        # Request with timeout
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        
-        response = session.get(download_url, headers=headers, timeout=30)
+        # Download the file
+        response = download_file_from_google_drive(file_id)
         response.raise_for_status()
         
         # Check if response is valid
-        if not response.text.strip():
+        content = response.content
+        if not content:
             st.error("Received empty response from Google Drive")
             return gpd.GeoDataFrame()
         
-        # Load GeoDataFrame with optimization
+        # Try to decode and validate JSON
         try:
-            gdf = gpd.read_file(
-                response.text,
-                engine='pyogrio'  # Faster engine if available
-            )
-        except:
-            # Fallback to default engine
-            gdf = gpd.read_file(response.text)
+            content_text = content.decode('utf-8')
+            # Validate it's JSON
+            json.loads(content_text)
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            st.error(f"Invalid GeoJSON format: {str(e)}")
+            return gpd.GeoDataFrame()
+        
+        # Load GeoDataFrame
+        try:
+            # Use StringIO for better compatibility
+            gdf = gpd.read_file(io.StringIO(content_text))
+        except Exception as e:
+            st.error(f"Error parsing GeoJSON: {str(e)}")
+            return gpd.GeoDataFrame()
         
         # Validate the GeoDataFrame
         if gdf.empty:
@@ -149,6 +159,9 @@ def load_geojson_from_drive():
         # Ensure valid geometry and CRS
         if gdf.crs is None:
             gdf = gdf.set_crs(epsg=4326)
+        
+        # Validate geometries before simplification
+        gdf['geometry'] = gdf['geometry'].make_valid()
         
         # Simplify geometries for better performance
         gdf['geometry'] = gdf.geometry.simplify(SIMPLIFICATION_TOLERANCE)
@@ -168,75 +181,125 @@ def load_geojson_from_drive():
         
     except Exception as e:
         st.error(f"Error loading data: {str(e)}")
+        import traceback
+        st.error(f"Traceback: {traceback.format_exc()}")
         return gpd.GeoDataFrame()
 
 def create_choropleth_map(gdf, indicator, centroid_y, centroid_x):
     """Create an optimized Folium choropleth map."""
-    m = folium.Map(
-        location=[centroid_y, centroid_x],
-        zoom_start=6,
-        tiles='cartodbpositron',  # Lighter tiles
-        control_scale=True,
-        prefer_canvas=True  # Better performance for many polygons
-    )
-    
-    # Calculate min and max values
-    min_val = gdf[indicator].min()
-    max_val = gdf[indicator].max()
-    
-    # Create style function
-    def style_function(feature):
-        value = feature['properties'][indicator]
-        return {
-            'fillColor': get_color(value, min_val, max_val),
-            'color': '#666666',
-            'weight': 0.3,
-            'fillOpacity': 0.7
-        }
-    
-    # Add GeoJson with styling and tooltips
-    folium.GeoJson(
-        gdf,
-        name='choropleth',
-        style_function=style_function,
-        tooltip=folium.GeoJsonTooltip(
-            fields=['ward', indicator, 'county'],
-            aliases=['Ward:', f'{indicator}:', 'County:'],
-            style="font-size: 11px;"
+    try:
+        m = folium.Map(
+            location=[centroid_y, centroid_x],
+            zoom_start=6,
+            tiles='cartodbpositron',
+            control_scale=True,
+            prefer_canvas=True
         )
-    ).add_to(m)
+        
+        # Calculate min and max values, handling NaN
+        valid_values = gdf[indicator].dropna()
+        if len(valid_values) == 0:
+            st.warning(f"No valid values found for {indicator}")
+            return m
+        
+        min_val = valid_values.min()
+        max_val = valid_values.max()
+        
+        # Prepare GeoJSON with proper structure
+        geojson_data = json.loads(gdf.to_json())
+        
+        # Create style function that handles missing properties safely
+        def style_function(feature):
+            try:
+                props = feature.get('properties', {})
+                value = props.get(indicator)
+                
+                if value is None or pd.isna(value):
+                    return {
+                        'fillColor': '#808080',
+                        'color': '#666666',
+                        'weight': 0.3,
+                        'fillOpacity': 0.5
+                    }
+                
+                return {
+                    'fillColor': get_color(value, min_val, max_val),
+                    'color': '#666666',
+                    'weight': 0.3,
+                    'fillOpacity': 0.7
+                }
+            except Exception as e:
+                # Fallback style
+                return {
+                    'fillColor': '#808080',
+                    'color': '#666666',
+                    'weight': 0.3,
+                    'fillOpacity': 0.5
+                }
+        
+        # Prepare tooltip fields - only use fields that exist
+        tooltip_fields = []
+        tooltip_aliases = []
+        
+        for field, alias in [('ward', 'Ward:'), (indicator, f'{indicator}:'), ('county', 'County:')]:
+            if field in gdf.columns:
+                tooltip_fields.append(field)
+                tooltip_aliases.append(alias)
+        
+        # Add GeoJson with styling and tooltips
+        folium.GeoJson(
+            geojson_data,
+            name='choropleth',
+            style_function=style_function,
+            tooltip=folium.GeoJsonTooltip(
+                fields=tooltip_fields,
+                aliases=tooltip_aliases,
+                style="font-size: 11px;"
+            )
+        ).add_to(m)
+        
+        # Add minimal legend
+        template = """
+        {% macro html(this, kwargs) %}
+        <div style="
+            position: fixed; 
+            bottom: 50px;
+            left: 50px;
+            width: 120px;
+            height: 70px;
+            z-index:9999;
+            font-size:12px;
+            background: white;
+            border: 1px solid #ccc;
+            border-radius: 3px;
+            padding: 5px;
+            ">
+            <div style="font-weight: bold; margin-bottom: 5px;">{{this.indicator}}</div>
+            <div style="font-size: 11px;">High: {{this.max}}</div>
+            <div style="font-size: 11px;">Low: {{this.min}}</div>
+        </div>
+        {% endmacro %}
+        """
+        
+        macro = MacroElement()
+        macro._template = Template(template)
+        macro.max = f"{max_val:.1f}"
+        macro.min = f"{min_val:.1f}"
+        macro.indicator = indicator
+        m.get_root().add_child(macro)
+        
+        return m
     
-    # Add minimal legend
-    template = """
-    {% macro html(this, kwargs) %}
-    <div style="
-        position: fixed; 
-        bottom: 50px;
-        left: 50px;
-        width: 120px;
-        height: 70px;
-        z-index:9999;
-        font-size:12px;
-        background: white;
-        border: 1px solid #ccc;
-        border-radius: 3px;
-        padding: 5px;
-        ">
-        <div style="font-weight: bold; margin-bottom: 5px;">{{this.indicator}}</div>
-        <div style="font-size: 11px;">High: {{this.max}}</div>
-        <div style="font-size: 11px;">Low: {{this.min}}</div>
-    </div>
-    {% endmacro %}
-    """
-    
-    macro = MacroElement()
-    macro._template = Template(template)
-    macro.max = f"{max_val:.1f}"
-    macro.min = f"{min_val:.1f}"
-    macro.indicator = indicator
-    m.get_root().add_child(macro)
-    
-    return m
+    except Exception as e:
+        st.error(f"Error creating map: {str(e)}")
+        import traceback
+        st.error(f"Traceback: {traceback.format_exc()}")
+        # Return basic map as fallback
+        return folium.Map(
+            location=[centroid_y, centroid_x],
+            zoom_start=6,
+            tiles='cartodbpositron'
+        )
 
 def get_data_summary(gdf):
     """Generate a comprehensive data summary for the AI agent with actual ward-level data."""
@@ -518,6 +581,10 @@ def main():
     
     if gdf is None or gdf.empty:
         st.error("No data available. Please check your data source and connection.")
+        st.info("**Troubleshooting steps:**")
+        st.info("1. Verify the Google Drive file ID in secrets")
+        st.info("2. Ensure the file is publicly accessible or shared")
+        st.info("3. Check that the file is a valid GeoJSON")
         return
     
     # Display data info for debugging
@@ -583,13 +650,15 @@ def main():
             )
             
             # Create and display map
-            m = create_choropleth_map(gdf, selected_indicator, centroid_y, centroid_x)
+            with st.spinner("Creating map..."):
+                m = create_choropleth_map(gdf, selected_indicator, centroid_y, centroid_x)
             
             # Display map with error handling
             try:
                 st_folium(m, width=700, height=500, key=f"map_{selected_indicator}")
             except Exception as e:
                 st.error(f"Map rendering error: {str(e)}")
+                st.info("Try refreshing the page or selecting a different indicator.")
         
         with col2:
             st.subheader("Map Controls")
@@ -830,6 +899,6 @@ if __name__ == "__main__":
         main()
     except Exception as e:
         st.error(f"Application error: {str(e)}")
-        st.info("Please check the logs for details.")
-
-
+        import traceback
+        st.error(f"Traceback: {traceback.format_exc()}")
+        st.info("Please check the error message above for details.")
