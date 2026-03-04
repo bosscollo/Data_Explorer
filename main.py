@@ -185,7 +185,6 @@ def load_geojson_from_drive():
         st.error(f"Traceback: {traceback.format_exc()}")
         return gpd.GeoDataFrame()
 
-@st.cache_data(ttl=300, show_spinner=False)
 def create_choropleth_map(_gdf, indicator, centroid_y, centroid_x):
     """Create an optimized Folium choropleth map with caching."""
     try:
